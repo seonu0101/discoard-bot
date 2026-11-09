@@ -28,11 +28,13 @@ import discord
 from discord import app_commands
 from dotenv import load_dotenv
 
-API_URL = "https://leaderboard.bettermultiplayer.com/leaderboard/{track}?limit=10&offset=0"
+API_URL = "https://leaderboard.bettermultiplayer.com/leaderboard/{track}?limit={limit}&offset=0"
 TRACK_LABELS = {0: "Duel", 1: "United Combat", 2: "Spirit Ashes"}
 STATE_FILE = Path(__file__).with_name("state.json")
 MEDAL_COLORS = {1: 0xFFD700, 2: 0xC0C0C0, 3: 0xCD7F32}
 DEFAULT_COLOR = 0x5865F2
+TOP_N = 25               # 표시할 인원
+EMBEDS_PER_MESSAGE = 10  # 디스코드 제한: 메시지 하나에 임베드 최대 10개
 
 log = logging.getLogger("leaderboard-bot")
 
@@ -60,15 +62,15 @@ def read_config() -> dict:
 # ---------------------------------------------------------------- 데이터 가져오기
 
 async def fetch_leaderboard(session: aiohttp.ClientSession, track: int) -> list[dict]:
-    """상위 10명 목록을 가져온다. 실패하면 예외가 난다."""
-    url = API_URL.format(track=track)
+    """상위 TOP_N명 목록을 가져온다. 실패하면 예외가 난다."""
+    url = API_URL.format(track=track, limit=TOP_N)
     timeout = aiohttp.ClientTimeout(total=10)
     headers = {"User-Agent": "leaderboard-discord-bot"}
     async with session.get(url, timeout=timeout, headers=headers) as resp:
         resp.raise_for_status()
         data = await resp.json()
     players = []
-    for row in data.get("data", [])[:10]:
+    for row in data.get("data", [])[:TOP_N]:
         p = row.get("player") or {}
         players.append({
             "rank": row.get("rank_position"),
@@ -150,70 +152,114 @@ def signature(content: str | None, embeds: list[discord.Embed]) -> tuple:
     )
 
 
+def build_pages(players: list[dict], track: int, lang: str) -> list[tuple[str, list[discord.Embed]]]:
+    """디스코드는 메시지 하나에 임베드를 10개까지만 넣을 수 있어서 10명씩 나눈다.
+    첫 메시지에만 제목 문구를 넣는다."""
+    content, embeds = build_message(players, track, lang)
+    if not embeds:
+        return [(content, [])]
+    return [(content if i == 0 else "", embeds[i:i + EMBEDS_PER_MESSAGE])
+            for i in range(0, len(embeds), EMBEDS_PER_MESSAGE)]
+
+
 # ---------------------------------------------------------------- 채널/메시지 ID 저장
 
 def load_state(default_channel_id: int | None) -> dict | None:
     try:
         state = json.loads(STATE_FILE.read_text())
         if state.get("channel_id"):
+            if "message_ids" not in state:  # 예전 형식(메시지 1개) 호환
+                old = state.pop("message_id", None)
+                state["message_ids"] = [old] if old else []
             return state
     except (FileNotFoundError, ValueError):
         pass
     if default_channel_id:
-        return {"channel_id": default_channel_id, "message_id": None, "lang": "ko"}
+        return {"channel_id": default_channel_id, "message_ids": [], "lang": "ko"}
     return None
 
 
-def save_state(channel_id: int, message_id: int, lang: str) -> None:
+def save_state(channel_id: int, message_ids: list[int], lang: str) -> None:
     STATE_FILE.write_text(json.dumps(
-        {"channel_id": channel_id, "message_id": message_id, "lang": lang}, indent=2) + "\n")
+        {"channel_id": channel_id, "message_ids": message_ids, "lang": lang}, indent=2) + "\n")
 
 
 # ---------------------------------------------------------------- 디스코드에 반영
 
+async def delete_messages(channel, message_ids: list[int]) -> None:
+    for mid in message_ids:
+        try:
+            await channel.get_partial_message(mid).delete()
+        except discord.HTTPException:
+            pass  # 이미 지워졌거나 권한이 없으면 그냥 둔다
+
+
+async def send_pages(channel, pages) -> list[int]:
+    ids = []
+    for content, embeds in pages:
+        message = await channel.send(content=content, embeds=embeds)
+        ids.append(message.id)
+    return ids
+
+
 async def sync_message(client: discord.Client, default_channel_id: int | None,
                        players: list[dict], track: int) -> str:
-    """저장된 메시지를 내용이 바뀌었을 때만 수정한다. 없으면 새로 만든다."""
+    """저장된 메시지들을 내용이 바뀐 것만 수정한다. 지워진 게 있으면 새로 올린다."""
     state = load_state(default_channel_id)
     if state is None:
         return "아직 채널이 정해지지 않았습니다 — 디스코드에서 /리더보드 또는 /leaderboard 를 입력하세요"
     lang = state.get("lang", "ko")
-    content, embeds = build_message(players, track, lang)
+    pages = build_pages(players, track, lang)
     channel = client.get_partial_messageable(state["channel_id"])
+    saved_ids = state["message_ids"]
 
-    message = None
-    if state.get("message_id"):
+    # 저장된 메시지들을 확인 (하나라도 지워졌으면 순서가 깨지므로 전부 다시 올린다)
+    messages = []
+    for mid in saved_ids:
         try:
-            message = await channel.fetch_message(state["message_id"])
+            messages.append(await channel.fetch_message(mid))
         except discord.NotFound:
-            log.info("저장된 메시지(%s)가 삭제되어 새로 만듭니다.", state["message_id"])
+            continue  # 지워진 메시지는 건너뛰고 나머지는 확인(아래에서 정리)
+    if len(messages) != len(saved_ids) or not saved_ids:
+        if saved_ids:
+            log.info("저장된 메시지가 삭제되어 새로 올립니다.")
+        await delete_messages(channel, [m.id for m in messages])
+        ids = await send_pages(channel, pages)
+        save_state(state["channel_id"], ids, lang)
+        return f"새 메시지 {len(ids)}개를 보냈습니다 (채널 {state['channel_id']})"
 
-    if message is None:
-        message = await channel.send(content=content, embeds=embeds)
-        save_state(state["channel_id"], message.id, lang)
-        return f"새 메시지를 보냈습니다 (채널 {state['channel_id']}, 메시지 {message.id})"
+    changed = 0
+    for message, (content, embeds) in zip(messages, pages):
+        if signature(message.content, message.embeds) != signature(content, embeds):
+            await message.edit(content=content, embeds=embeds)
+            changed += 1
 
-    if signature(message.content, message.embeds) == signature(content, embeds):
+    ids = [m.id for m in messages]
+    if len(pages) > len(messages):  # 인원이 늘어 메시지가 더 필요하면 뒤에 추가
+        ids += await send_pages(channel, pages[len(messages):])
+        changed += 1
+    elif len(pages) < len(messages):  # 인원이 줄어 남는 메시지는 삭제
+        await delete_messages(channel, ids[len(pages):])
+        ids = ids[:len(pages)]
+        changed += 1
+    if ids != saved_ids:
+        save_state(state["channel_id"], ids, lang)
+
+    if not changed:
         return "변경 없음 — 수정하지 않았습니다"
-
-    await message.edit(content=content, embeds=embeds)
     return "순위가 바뀌어 메시지를 수정했습니다"
 
 
 async def post_here(client: discord.Client, default_channel_id: int | None,
                     channel: discord.abc.Messageable, players: list[dict],
                     track: int, lang: str) -> None:
-    """/리더보드 명령어: 이 채널에 새 메시지를 올리고, 예전 메시지는 지운다."""
+    """/리더보드 명령어: 이 채널에 새로 올리고, 예전 메시지들은 지운다."""
     old = load_state(default_channel_id)
-    content, embeds = build_message(players, track, lang)
-    message = await channel.send(content=content, embeds=embeds)
-    save_state(channel.id, message.id, lang)
-    if old and old.get("message_id") and old["message_id"] != message.id:
-        try:
-            await client.get_partial_messageable(old["channel_id"]).get_partial_message(
-                old["message_id"]).delete()
-        except discord.HTTPException:
-            pass  # 이미 지워졌거나 권한이 없으면 그냥 둔다
+    ids = await send_pages(channel, build_pages(players, track, lang))
+    save_state(channel.id, ids, lang)
+    if old and old["message_ids"]:
+        await delete_messages(client.get_partial_messageable(old["channel_id"]),
+                              [m for m in old["message_ids"] if m not in ids])
 
 
 # ---------------------------------------------------------------- 계속 실행 모드 (명령어 지원)
