@@ -72,7 +72,7 @@ async def fetch_leaderboard(session: aiohttp.ClientSession, track: int) -> list[
         p = row.get("player") or {}
         players.append({
             "rank": row.get("rank_position"),
-            "name": (p.get("persona_name") or "").strip() or "(이름 없음)",
+            "name": (p.get("persona_name") or "").strip(),
             "avatar": p.get("avatar_url") or None,
             "steam_id": p.get("steam_id"),
             "rating": row.get("rating"),
@@ -85,19 +85,49 @@ async def fetch_leaderboard(session: aiohttp.ClientSession, track: int) -> list[
 
 # ---------------------------------------------------------------- 임베드 만들기
 
-def build_message(players: list[dict], track: int) -> tuple[str, list[discord.Embed]]:
+# 언어별 문구. ko = /리더보드, en = /leaderboard
+TEXT = {
+    "ko": {
+        "header": "🏆 **{label} 리더보드** 상위 {n}명",
+        "empty": "🏆 **{label} 리더보드** — 아직 순위 데이터가 없습니다.",
+        "record": "{w}승 {l}패",
+        "draws": " {d}무",
+        "rating": "레이팅 **{r}** · {record}",
+        "no_name": "(이름 없음)",
+        "site_down": "리더보드 사이트에 접속하지 못했습니다. 잠시 후 다시 시도하세요.",
+        "no_perm": "이 채널에 메시지를 올릴 권한이 없습니다. 봇에게 '채널 보기 / 메시지 보내기 / "
+                   "링크 첨부 / 메시지 기록 보기' 권한을 주세요.",
+        "done": "완료! 이 채널에 리더보드를 올렸고 {s}초마다 갱신합니다.",
+    },
+    "en": {
+        "header": "🏆 **{label} Leaderboard** Top {n}",
+        "empty": "🏆 **{label} Leaderboard** — no ranking data yet.",
+        "record": "{w}W {l}L",
+        "draws": " {d}D",
+        "rating": "Rating **{r}** · {record}",
+        "no_name": "(no name)",
+        "site_down": "Couldn't reach the leaderboard site. Please try again in a moment.",
+        "no_perm": "I don't have permission to post here. Please give me View Channel, "
+                   "Send Messages, Embed Links and Read Message History.",
+        "done": "Done! Posted the leaderboard here; it refreshes every {s} seconds.",
+    },
+}
+
+
+def build_message(players: list[dict], track: int, lang: str = "ko") -> tuple[str, list[discord.Embed]]:
+    t = TEXT.get(lang, TEXT["ko"])
     label = TRACK_LABELS.get(track, f"Track {track}")
-    content = f"🏆 **{label} 리더보드** 상위 {len(players)}명"
+    content = t["header"].format(label=label, n=len(players))
     if not players:
-        content = f"🏆 **{label} 리더보드** — 아직 순위 데이터가 없습니다."
+        content = t["empty"].format(label=label)
     embeds = []
     for p in players:
-        record = f"{p['wins']}승 {p['losses']}패"
+        record = t["record"].format(w=p["wins"], l=p["losses"])
         if p["draws"]:
-            record += f" {p['draws']}무"
+            record += t["draws"].format(d=p["draws"])
         embed = discord.Embed(
-            title=f"#{p['rank']}  {p['name']}"[:256],
-            description=f"레이팅 **{p['rating']}** · {record}",
+            title=f"#{p['rank']}  {p['name'] or t['no_name']}"[:256],
+            description=t["rating"].format(r=p["rating"], record=record),
             url=f"https://steamcommunity.com/profiles/{p['steam_id']}" if p["steam_id"] else None,
             color=MEDAL_COLORS.get(p["rank"], DEFAULT_COLOR),
         )
@@ -128,22 +158,25 @@ def load_state(default_channel_id: int | None) -> dict | None:
     except (FileNotFoundError, ValueError):
         pass
     if default_channel_id:
-        return {"channel_id": default_channel_id, "message_id": None}
+        return {"channel_id": default_channel_id, "message_id": None, "lang": "ko"}
     return None
 
 
-def save_state(channel_id: int, message_id: int) -> None:
-    STATE_FILE.write_text(json.dumps({"channel_id": channel_id, "message_id": message_id}, indent=2) + "\n")
+def save_state(channel_id: int, message_id: int, lang: str) -> None:
+    STATE_FILE.write_text(json.dumps(
+        {"channel_id": channel_id, "message_id": message_id, "lang": lang}, indent=2) + "\n")
 
 
 # ---------------------------------------------------------------- 디스코드에 반영
 
 async def sync_message(client: discord.Client, default_channel_id: int | None,
-                       content: str, embeds: list[discord.Embed]) -> str:
+                       players: list[dict], track: int) -> str:
     """저장된 메시지를 내용이 바뀌었을 때만 수정한다. 없으면 새로 만든다."""
     state = load_state(default_channel_id)
     if state is None:
-        return "아직 채널이 정해지지 않았습니다 — 디스코드에서 /리더보드 를 입력하세요"
+        return "아직 채널이 정해지지 않았습니다 — 디스코드에서 /리더보드 또는 /leaderboard 를 입력하세요"
+    lang = state.get("lang", "ko")
+    content, embeds = build_message(players, track, lang)
     channel = client.get_partial_messageable(state["channel_id"])
 
     message = None
@@ -155,7 +188,7 @@ async def sync_message(client: discord.Client, default_channel_id: int | None,
 
     if message is None:
         message = await channel.send(content=content, embeds=embeds)
-        save_state(state["channel_id"], message.id)
+        save_state(state["channel_id"], message.id, lang)
         return f"새 메시지를 보냈습니다 (채널 {state['channel_id']}, 메시지 {message.id})"
 
     if signature(message.content, message.embeds) == signature(content, embeds):
@@ -166,12 +199,13 @@ async def sync_message(client: discord.Client, default_channel_id: int | None,
 
 
 async def post_here(client: discord.Client, default_channel_id: int | None,
-                    channel: discord.abc.Messageable, content: str,
-                    embeds: list[discord.Embed]) -> None:
+                    channel: discord.abc.Messageable, players: list[dict],
+                    track: int, lang: str) -> None:
     """/리더보드 명령어: 이 채널에 새 메시지를 올리고, 예전 메시지는 지운다."""
     old = load_state(default_channel_id)
+    content, embeds = build_message(players, track, lang)
     message = await channel.send(content=content, embeds=embeds)
-    save_state(channel.id, message.id)
+    save_state(channel.id, message.id, lang)
     if old and old.get("message_id") and old["message_id"] != message.id:
         try:
             await client.get_partial_messageable(old["channel_id"]).get_partial_message(
@@ -191,27 +225,30 @@ class LeaderboardBot(discord.Client):
         self.lock = asyncio.Lock()  # 명령어와 자동 갱신이 동시에 메시지를 건드리지 않도록
         self.session: aiohttp.ClientSession | None = None
 
-        @self.tree.command(name="리더보드", description="이 채널에 리더보드를 올리고 계속 갱신합니다")
+        self.add_post_command("리더보드", "이 채널에 리더보드를 올리고 계속 갱신합니다", "ko")
+        self.add_post_command("leaderboard", "Post the leaderboard in this channel and keep it updated", "en")
+
+    def add_post_command(self, name: str, description: str, lang: str):
+        t = TEXT[lang]
+
+        @self.tree.command(name=name, description=description)
         @app_commands.default_permissions(manage_channels=True)
         @app_commands.guild_only()
-        async def leaderboard_cmd(interaction: discord.Interaction):
+        async def post_cmd(interaction: discord.Interaction):
             await interaction.response.defer(ephemeral=True, thinking=True)
             await self.refresh_data()
             if self.last_good is None:
-                await interaction.followup.send("리더보드 사이트에 접속하지 못했습니다. 잠시 후 다시 시도하세요.")
+                await interaction.followup.send(t["site_down"])
                 return
-            content, embeds = build_message(self.last_good, self.config["track"])
             try:
                 async with self.lock:
-                    await post_here(self, self.config["channel_id"], interaction.channel, content, embeds)
+                    await post_here(self, self.config["channel_id"], interaction.channel,
+                                    self.last_good, self.config["track"], lang)
             except discord.Forbidden:
-                await interaction.followup.send(
-                    "이 채널에 메시지를 올릴 권한이 없습니다. 봇에게 '채널 보기 / 메시지 보내기 / "
-                    "링크 첨부 / 메시지 기록 보기' 권한을 주세요.")
+                await interaction.followup.send(t["no_perm"])
                 return
-            log.info("/리더보드 실행: #%s 채널에 메시지를 올렸습니다", interaction.channel)
-            await interaction.followup.send(
-                f"완료! 이 채널에 리더보드를 올렸고 {self.config['interval']:g}초마다 갱신합니다.")
+            log.info("/%s 실행: #%s 채널에 메시지를 올렸습니다", name, interaction.channel)
+            await interaction.followup.send(t["done"].format(s=f"{self.config['interval']:g}"))
 
     async def setup_hook(self):
         self.session = aiohttp.ClientSession(trust_env=True)
@@ -254,10 +291,10 @@ class LeaderboardBot(discord.Client):
         while not self.is_closed():
             await self.refresh_data()
             if self.last_good is not None:
-                content, embeds = build_message(self.last_good, self.config["track"])
                 try:
                     async with self.lock:
-                        note = await sync_message(self, self.config["channel_id"], content, embeds)
+                        note = await sync_message(self, self.config["channel_id"],
+                                                  self.last_good, self.config["track"])
                 except discord.Forbidden:
                     note = ("권한 부족: 봇에게 이 채널의 '채널 보기 / 메시지 보내기 / "
                             "링크 첨부 / 메시지 기록 보기' 권한이 있는지 확인하세요.")
@@ -280,8 +317,7 @@ async def run_once(config: dict) -> None:
         except Exception as exc:
             log.warning("사이트 접속 실패, 디스코드 메시지는 그대로 둡니다: %r", exc)
             return
-        content, embeds = build_message(players, config["track"])
-        log.info(await sync_message(client, config["channel_id"], content, embeds))
+        log.info(await sync_message(client, config["channel_id"], players, config["track"]))
 
 
 async def dry_run() -> None:
