@@ -130,7 +130,7 @@ def build_message(players: list[dict], track: int, lang: str = "ko") -> tuple[st
         embed = discord.Embed(
             title=f"#{p['rank']}  {p['name'] or t['no_name']}"[:256],
             description=t["rating"].format(r=p["rating"], record=record),
-            url=f"https://steamcommunity.com/profiles/{p['steam_id']}" if p["steam_id"] else None,
+            url=f"https://leaderboard.bettermultiplayer.com/player/{p['steam_id']}" if p["steam_id"] else None,
             color=MEDAL_COLORS.get(p["rank"], DEFAULT_COLOR),
         )
         if p["avatar"]:
