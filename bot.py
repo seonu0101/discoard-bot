@@ -98,6 +98,7 @@ TEXT = {
         "no_perm": "이 채널에 메시지를 올릴 권한이 없습니다. 봇에게 '채널 보기 / 메시지 보내기 / "
                    "링크 첨부 / 메시지 기록 보기' 권한을 주세요.",
         "done": "완료! 이 채널에 리더보드를 올렸고 {s}초마다 갱신합니다.",
+        "admin_only": "이 명령어는 서버 관리자만 사용할 수 있습니다.",
     },
     "en": {
         "header": "🏆 **{label} Leaderboard** Top {n}",
@@ -110,6 +111,7 @@ TEXT = {
         "no_perm": "I don't have permission to post here. Please give me View Channel, "
                    "Send Messages, Embed Links and Read Message History.",
         "done": "Done! Posted the leaderboard here; it refreshes every {s} seconds.",
+        "admin_only": "Only server administrators can use this command.",
     },
 }
 
@@ -232,9 +234,16 @@ class LeaderboardBot(discord.Client):
         t = TEXT[lang]
 
         @self.tree.command(name=name, description=description)
-        @app_commands.default_permissions(manage_channels=True)
+        # 관리자에게만 명령어가 보이게 하고(default_permissions),
+        # 서버 설정에서 다른 사람에게 열어 줘도 실행할 때 한 번 더 확인한다.
+        @app_commands.default_permissions(administrator=True)
         @app_commands.guild_only()
         async def post_cmd(interaction: discord.Interaction):
+            perms = getattr(interaction.user, "guild_permissions", None)
+            if not (perms and perms.administrator):
+                await interaction.response.send_message(t["admin_only"], ephemeral=True)
+                log.info("/%s 거부: 관리자가 아닌 %s", name, interaction.user)
+                return
             await interaction.response.defer(ephemeral=True, thinking=True)
             await self.refresh_data()
             if self.last_good is None:
