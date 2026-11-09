@@ -9,8 +9,11 @@ APP_DIR="$HOME/discoard-bot"
 SERVICE=leaderboard-bot
 
 echo "== 1/4 필요한 프로그램 설치 =="
-sudo apt-get update -y -q
-sudo apt-get install -y -q python3 python3-venv git
+# 새 서버는 처음 몇 분간 자동 업데이트가 돌기 때문에 끝날 때까지 기다리고(Lock::Timeout),
+# 설치 중 질문 창(서비스 재시작 여부 등)이 뜨지 않게 한다.
+APT="sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get -o DPkg::Lock::Timeout=900 -y -q"
+$APT update
+$APT install python3 python3-venv git
 
 echo "== 2/4 코드 받기 =="
 if [ -d "$APP_DIR/.git" ]; then
