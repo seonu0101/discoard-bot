@@ -6,7 +6,7 @@ on:
   workflow_dispatch:         # Actions 탭에서 "Run workflow"로 직접 실행
 
 permissions:
-  contents: write            # message_id.txt 저장(커밋)용
+  contents: write            # state.json(채널·메시지 ID) 저장용
 
 concurrency:
   group: leaderboard
@@ -30,13 +30,19 @@ jobs:
         env:
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
-        run: python bot.py --once
-
-      - name: Save message ID
         run: |
-          git add message_id.txt
+          if [ -z "$DISCORD_TOKEN" ]; then
+            echo "DISCORD_TOKEN secret이 아직 없어서 건너뜁니다."
+            exit 0
+          fi
+          python bot.py --once
+
+      - name: Save state
+        run: |
+          [ -f state.json ] || exit 0
+          git add state.json
           if git diff --cached --quiet; then exit 0; fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "Save Discord message ID"
+          git commit -m "Save Discord channel and message ID"
           git push
