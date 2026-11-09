@@ -12,7 +12,8 @@ BetterMultiplayer 리더보드를 디스코드 임베드로 보여주는 봇.
   TRACK            0=Duel, 1=United Combat, 2=Spirit Ashes (기본 0)
   UPDATE_INTERVAL  갱신 간격(초), 계속 실행 모드에서만 사용 (기본 5)
 
-어느 채널의 어떤 메시지를 수정할지는 state.json 파일에 저장됩니다.
+서버마다 어느 채널의 어떤 메시지를 수정할지 state.json 파일에 저장됩니다.
+여러 서버에서 동시에 쓸 수 있습니다 (서버당 리더보드 1개).
 """
 
 import argparse
@@ -21,6 +22,7 @@ import json
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 import aiohttp
@@ -35,6 +37,7 @@ MEDAL_COLORS = {1: 0xFFD700, 2: 0xC0C0C0, 3: 0xCD7F32}
 DEFAULT_COLOR = 0x5865F2
 TOP_N = 25               # 표시할 인원
 EMBEDS_PER_MESSAGE = 10  # 디스코드 제한: 메시지 하나에 임베드 최대 10개
+RECHECK_SECONDS = 60     # 내용이 그대로여도 이 간격마다 메시지가 지워졌는지 확인
 
 log = logging.getLogger("leaderboard-bot")
 
@@ -162,29 +165,35 @@ def build_pages(players: list[dict], track: int, lang: str) -> list[tuple[str, l
             for i in range(0, len(embeds), EMBEDS_PER_MESSAGE)]
 
 
-# ---------------------------------------------------------------- 채널/메시지 ID 저장
+# ---------------------------------------------------------------- 서버별 채널/메시지 ID 저장
+# state.json 형식: {"boards": {"<서버 ID>": {"channel_id": ..., "message_ids": [...], "lang": "ko"}}}
 
-def load_state(default_channel_id: int | None) -> dict | None:
+def load_boards(default_channel_id: int | None = None) -> dict:
     try:
-        state = json.loads(STATE_FILE.read_text())
-        if state.get("channel_id"):
-            if "message_ids" not in state:  # 예전 형식(메시지 1개) 호환
-                old = state.pop("message_id", None)
-                state["message_ids"] = [old] if old else []
-            return state
+        data = json.loads(STATE_FILE.read_text())
     except (FileNotFoundError, ValueError):
-        pass
-    if default_channel_id:
-        return {"channel_id": default_channel_id, "message_ids": [], "lang": "ko"}
-    return None
+        data = {}
+    if "boards" in data:
+        boards = data["boards"]
+    elif data.get("channel_id"):  # 예전 형식(채널 1개) 호환
+        ids = data.get("message_ids") or ([data["message_id"]] if data.get("message_id") else [])
+        boards = {"legacy": {"channel_id": data["channel_id"], "message_ids": ids,
+                             "lang": data.get("lang", "ko")}}
+    else:
+        boards = {}
+    if not boards and default_channel_id:  # .env/Secrets의 CHANNEL_ID 사용
+        boards = {"env": {"channel_id": default_channel_id, "message_ids": [], "lang": "ko"}}
+    return boards
 
 
-def save_state(channel_id: int, message_ids: list[int], lang: str) -> None:
-    STATE_FILE.write_text(json.dumps(
-        {"channel_id": channel_id, "message_ids": message_ids, "lang": lang}, indent=2) + "\n")
+def save_boards(boards: dict) -> None:
+    STATE_FILE.write_text(json.dumps({"boards": boards}, indent=2) + "\n")
 
 
 # ---------------------------------------------------------------- 디스코드에 반영
+
+UNKNOWN_CHANNEL = 10003  # 디스코드 오류 코드: 채널이 없어짐
+
 
 async def delete_messages(channel, message_ids: list[int]) -> None:
     for mid in message_ids:
@@ -202,38 +211,30 @@ async def send_pages(channel, pages) -> list[int]:
     return ids
 
 
-async def sync_message(client: discord.Client, default_channel_id: int | None,
-                       players: list[dict], track: int) -> str:
-    """저장된 메시지들을 내용이 바뀐 것만 수정한다. 지워진 게 있으면 새로 올린다."""
-    state = load_state(default_channel_id)
-    if state is None:
-        return "아직 채널이 정해지지 않았습니다 — 디스코드에서 /리더보드 또는 /leaderboard 를 입력하세요"
-    lang = state.get("lang", "ko")
-    pages = build_pages(players, track, lang)
-    channel = client.get_partial_messageable(state["channel_id"])
-    saved_ids = state["message_ids"]
+async def sync_board(client: discord.Client, board: dict, pages) -> str:
+    """한 서버의 메시지들을 바뀐 것만 수정한다. 지워진 게 있으면 새로 올린다.
+    board["message_ids"]를 직접 고친다."""
+    channel = client.get_partial_messageable(board["channel_id"])
+    saved_ids = board["message_ids"]
 
-    # 저장된 메시지들을 확인 (하나라도 지워졌으면 순서가 깨지므로 전부 다시 올린다)
+    # 저장된 메시지 확인 (하나라도 지워졌으면 순서가 깨지므로 전부 다시 올린다)
     messages = []
     for mid in saved_ids:
         try:
             messages.append(await channel.fetch_message(mid))
-        except discord.NotFound:
-            continue  # 지워진 메시지는 건너뛰고 나머지는 확인(아래에서 정리)
+        except discord.NotFound as exc:
+            if exc.code == UNKNOWN_CHANNEL:
+                raise
     if len(messages) != len(saved_ids) or not saved_ids:
-        if saved_ids:
-            log.info("저장된 메시지가 삭제되어 새로 올립니다.")
         await delete_messages(channel, [m.id for m in messages])
-        ids = await send_pages(channel, pages)
-        save_state(state["channel_id"], ids, lang)
-        return f"새 메시지 {len(ids)}개를 보냈습니다 (채널 {state['channel_id']})"
+        board["message_ids"] = await send_pages(channel, pages)
+        return f"새 메시지 {len(pages)}개를 보냈습니다" + (" (기존 메시지가 삭제됨)" if saved_ids else "")
 
     changed = 0
     for message, (content, embeds) in zip(messages, pages):
         if signature(message.content, message.embeds) != signature(content, embeds):
             await message.edit(content=content, embeds=embeds)
             changed += 1
-
     ids = [m.id for m in messages]
     if len(pages) > len(messages):  # 인원이 늘어 메시지가 더 필요하면 뒤에 추가
         ids += await send_pages(channel, pages[len(messages):])
@@ -242,24 +243,87 @@ async def sync_message(client: discord.Client, default_channel_id: int | None,
         await delete_messages(channel, ids[len(pages):])
         ids = ids[:len(pages)]
         changed += 1
-    if ids != saved_ids:
-        save_state(state["channel_id"], ids, lang)
-
-    if not changed:
-        return "변경 없음 — 수정하지 않았습니다"
-    return "순위가 바뀌어 메시지를 수정했습니다"
+    board["message_ids"] = ids
+    return "순위가 바뀌어 메시지를 수정했습니다" if changed else "변경 없음"
 
 
-async def post_here(client: discord.Client, default_channel_id: int | None,
+def pages_key(pages) -> tuple:
+    return tuple(signature(c, e) for c, e in pages)
+
+
+async def sync_all(client: discord.Client, default_channel_id: int | None,
+                   players: list[dict], track: int, recent: dict | None = None) -> dict[str, str]:
+    """모든 서버의 리더보드를 갱신한다. 서버별 결과 문구를 돌려준다.
+
+    recent(계속 실행 모드에서만 사용): 내용이 그대로면 RECHECK_SECONDS 동안은
+    디스코드에 확인 요청도 보내지 않아서, 서버가 많아도 요청 수가 적다."""
+    boards = load_boards(default_channel_id)
+    before = json.dumps(boards, sort_keys=True)
+    pages_by_lang: dict[str, list] = {}
+    notes: dict[str, str] = {}
+    now = time.monotonic()
+
+    for key, board in list(boards.items()):
+        lang = board.get("lang", "ko")
+        if lang not in pages_by_lang:
+            pages_by_lang[lang] = build_pages(players, track, lang)
+        pages = pages_by_lang[lang]
+        sig = (board["channel_id"], tuple(board["message_ids"]), pages_key(pages))
+        if recent is not None and key in recent:
+            last_sig, last_time = recent[key]
+            if last_sig == sig and now - last_time < RECHECK_SECONDS:
+                continue
+        try:
+            notes[key] = await sync_board(client, board, pages)
+            if recent is not None:
+                recent[key] = ((board["channel_id"], tuple(board["message_ids"]), pages_key(pages)), now)
+        except discord.NotFound as exc:
+            if exc.code == UNKNOWN_CHANNEL:
+                notes[key] = "채널이 삭제되어 이 서버의 리더보드를 목록에서 뺐습니다"
+                del boards[key]
+            else:
+                notes[key] = f"디스코드 요청 실패: {exc}"
+        except discord.Forbidden:
+            notes[key] = ("권한 부족: 봇에게 이 채널의 '채널 보기 / 메시지 보내기 / "
+                          "링크 첨부 / 메시지 기록 보기' 권한이 있는지 확인하세요.")
+        except discord.HTTPException as exc:
+            notes[key] = f"디스코드 요청 실패: {exc}"
+
+    if json.dumps(boards, sort_keys=True) != before:
+        save_boards(boards)
+    return notes
+
+
+async def post_here(client: discord.Client, guild_id: int,
                     channel: discord.abc.Messageable, players: list[dict],
                     track: int, lang: str) -> None:
-    """/리더보드 명령어: 이 채널에 새로 올리고, 예전 메시지들은 지운다."""
-    old = load_state(default_channel_id)
+    """/리더보드 명령어: 이 채널에 새로 올리고, 같은 서버의 예전 메시지들은 지운다.
+    다른 서버의 리더보드는 건드리지 않는다."""
+    boards = load_boards()
+    key = str(guild_id)
     ids = await send_pages(channel, build_pages(players, track, lang))
-    save_state(channel.id, ids, lang)
-    if old and old["message_ids"]:
-        await delete_messages(client.get_partial_messageable(old["channel_id"]),
-                              [m for m in old["message_ids"] if m not in ids])
+
+    # 같은 서버의 예전 리더보드 찾기 (예전 형식/CHANNEL_ID로 만든 것 포함)
+    old = []
+    for k, b in list(boards.items()):
+        ch = client.get_channel(b["channel_id"]) if hasattr(client, "get_channel") else None
+        same_guild = k == key or (k in ("legacy", "env") and getattr(getattr(ch, "guild", None), "id", None) == guild_id)
+        if same_guild:
+            old.append(b)
+            del boards[k]
+    boards[key] = {"channel_id": channel.id, "message_ids": ids, "lang": lang}
+    save_boards(boards)
+    for b in old:
+        await delete_messages(client.get_partial_messageable(b["channel_id"]),
+                              [m for m in b["message_ids"] if m not in ids])
+
+
+def remove_board(guild_id: int) -> bool:
+    boards = load_boards()
+    if boards.pop(str(guild_id), None) is None:
+        return False
+    save_boards(boards)
+    return True
 
 
 # ---------------------------------------------------------------- 계속 실행 모드 (명령어 지원)
@@ -270,8 +334,9 @@ class LeaderboardBot(discord.Client):
         self.config = config
         self.tree = app_commands.CommandTree(self)
         self.last_good: list[dict] | None = None
-        self.lock = asyncio.Lock()  # 명령어와 자동 갱신이 동시에 메시지를 건드리지 않도록
+        self.lock = asyncio.Lock()  # 명령어와 자동 갱신이 동시에 저장 파일을 건드리지 않도록
         self.session: aiohttp.ClientSession | None = None
+        self.recent: dict = {}
 
         self.add_post_command("리더보드", "이 채널에 리더보드를 올리고 계속 갱신합니다", "ko")
         self.add_post_command("leaderboard", "Post the leaderboard in this channel and keep it updated", "en")
@@ -297,12 +362,13 @@ class LeaderboardBot(discord.Client):
                 return
             try:
                 async with self.lock:
-                    await post_here(self, self.config["channel_id"], interaction.channel,
+                    await post_here(self, interaction.guild_id, interaction.channel,
                                     self.last_good, self.config["track"], lang)
+                    self.recent.pop(str(interaction.guild_id), None)
             except discord.Forbidden:
                 await interaction.followup.send(t["no_perm"])
                 return
-            log.info("/%s 실행: #%s 채널에 메시지를 올렸습니다", name, interaction.channel)
+            log.info("/%s 실행: [%s] #%s 채널에 올렸습니다", name, interaction.guild, interaction.channel)
             await interaction.followup.send(t["done"].format(s=f"{self.config['interval']:g}"))
 
     async def setup_hook(self):
@@ -334,30 +400,38 @@ class LeaderboardBot(discord.Client):
         await self.sync_commands(guild)
         log.info("새 서버에 초대됨, 명령어 등록: %s", guild.name)
 
+    async def on_guild_remove(self, guild: discord.Guild):
+        async with self.lock:
+            if remove_board(guild.id):
+                log.info("서버에서 내보내져 리더보드를 목록에서 뺐습니다: %s", guild.name)
+
     async def refresh_data(self):
         try:
             self.last_good = await fetch_leaderboard(self.session, self.config["track"])
         except Exception as exc:  # 사이트 접속 실패 → 마지막 정상 데이터 유지
             log.warning("사이트 접속 실패, 마지막 데이터를 유지합니다: %r", exc)
 
+    def board_name(self, key: str) -> str:
+        guild = self.get_guild(int(key)) if key.isdigit() else None
+        return guild.name if guild else key
+
     async def updater(self):
         await self.wait_until_ready()
-        last_note = None
+        last_notes: dict[str, str] = {}
+        waiting_logged = False
         while not self.is_closed():
             await self.refresh_data()
             if self.last_good is not None:
-                try:
-                    async with self.lock:
-                        note = await sync_message(self, self.config["channel_id"],
-                                                  self.last_good, self.config["track"])
-                except discord.Forbidden:
-                    note = ("권한 부족: 봇에게 이 채널의 '채널 보기 / 메시지 보내기 / "
-                            "링크 첨부 / 메시지 기록 보기' 권한이 있는지 확인하세요.")
-                except discord.HTTPException as exc:
-                    note = f"디스코드 요청 실패: {exc}"
-                if note != last_note:  # 같은 문구를 5초마다 반복해서 찍지 않기
-                    log.info(note)
-                    last_note = note
+                async with self.lock:
+                    notes = await sync_all(self, self.config["channel_id"], self.last_good,
+                                           self.config["track"], self.recent)
+                if not load_boards(self.config["channel_id"]) and not waiting_logged:
+                    log.info("아직 리더보드를 올린 서버가 없습니다 — 디스코드에서 /리더보드 또는 /leaderboard 를 입력하세요")
+                    waiting_logged = True
+                for key, note in notes.items():
+                    if last_notes.get(key) != note:  # 같은 문구를 반복해서 찍지 않기
+                        log.info("[%s] %s", self.board_name(key), note)
+                        last_notes[key] = note
             await asyncio.sleep(self.config["interval"])
 
 
@@ -367,12 +441,17 @@ async def run_once(config: dict) -> None:
     client = discord.Client(intents=discord.Intents.none(), proxy=config["proxy"])
     async with client, aiohttp.ClientSession(trust_env=True) as session:
         await client.login(config["token"])  # 토큰 확인 (틀리면 여기서 오류)
+        if not load_boards(config["channel_id"]):
+            log.info("아직 리더보드를 올린 서버가 없습니다.")
+            return
         try:
             players = await fetch_leaderboard(session, config["track"])
         except Exception as exc:
             log.warning("사이트 접속 실패, 디스코드 메시지는 그대로 둡니다: %r", exc)
             return
-        log.info(await sync_message(client, config["channel_id"], players, config["track"]))
+        notes = await sync_all(client, config["channel_id"], players, config["track"])
+        for key, note in notes.items():
+            log.info("[%s] %s", key, note)
 
 
 async def dry_run() -> None:
